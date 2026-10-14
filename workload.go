@@ -210,7 +210,7 @@ func Run(ctx context.Context, c Config, progress func(done int)) (*Outcome, erro
 				record(Op{Type: status, Process: process, Value: result})
 				if err != nil {
 					mu.Lock()
-					errs[err.Error()]++
+					errs[errKind(err)]++
 					mu.Unlock()
 				}
 				if status == "info" {
@@ -260,6 +260,20 @@ func runTxn(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel, 
 		return "info", mops, err // the commit may or may not have happened
 	}
 	return "ok", result, nil
+}
+
+// errKind is an error without the parts that differ every time (keys, timestamps, transaction ids
+// in CockroachDB's messages), so the same failure counts once.
+func errKind(err error) string {
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		return err.Error()
+	}
+	parts := strings.SplitN(pe.Message, ": ", 4)
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	return pe.Code + " " + strings.Join(parts, ": ")
 }
 
 func parseList(s string, err error) ([]int, error) {
