@@ -16,7 +16,7 @@ isocheck -isolation repeatable-read mysql://root@localhost:3306/db
 isocheck check history.edn
 ```
 
-It drops and creates a table called `isocheck` (`-table` to change it). `-save h.edn` keeps the history in the format Elle reads, and `isocheck check` checks a list-append history from Jepsen or Elle. The exit code is 1 when the database falls short of the level it was asked for (or `-expect`).
+It drops and creates a table called `isocheck` (`-table` to change it). `-save h.edn` keeps the history in the format Elle reads, and `isocheck check` checks a list-append history from Jepsen or Elle. The exit code is 1 when the database falls short of the level it was asked for (or `-expect`). On Postgres-protocol databases it also says when the database ran a different level from the one asked for.
 
 ```
 $ isocheck -isolation repeatable-read postgres://postgres@localhost:5432/x
@@ -39,23 +39,26 @@ Not repeatable-read.
 
 ## Results
 
-3,000 transactions from 10 clients at each level.
+The strongest model each level met, 3,000 transactions from 10 clients (1,000 on YugabyteDB), single node, default settings unless noted.
 
-| Database | Level | Strongest model it met | Anomalies |
+| Database | SERIALIZABLE | REPEATABLE READ | READ COMMITTED |
 |---|---|---|---|
-| Postgres 17 | SERIALIZABLE | strict serializable | none |
-| Postgres 17 | REPEATABLE READ | snapshot isolation | G2-item |
-| Postgres 17 | READ COMMITTED | read committed | G-single, G2-item, non-repeatable reads |
-| MySQL 8.4 | SERIALIZABLE | strict serializable | none |
-| MySQL 8.4 | REPEATABLE READ | read committed | G-single, G2-item, non-repeatable reads |
-| MySQL 8.4 | READ COMMITTED | read committed | G-single, G2-item, non-repeatable reads |
+| Postgres 17 | strict serializable | snapshot isolation | read committed |
+| MySQL 8.4 | strict serializable | **read committed** | read committed |
+| MariaDB 10.11 | strict serializable | **read committed** | read committed |
+| MariaDB 11.8 | strict serializable | snapshot isolation | read committed |
+| TiDB 8.5, pessimistic (default) | not supported | **read committed** | read committed |
+| TiDB 8.5, optimistic | | snapshot isolation | |
+| CockroachDB 26.3 | strict serializable | runs as SERIALIZABLE | read committed |
+| CockroachDB 26.3, REPEATABLE READ enabled | | snapshot isolation | |
+| YugabyteDB 2026.1 | strict serializable | snapshot isolation | read committed |
 
-MySQL's REPEATABLE READ is not snapshot isolation: a write reads the latest committed row, so a later read in the same transaction sees what other transactions committed in between.
+Snapshot isolation allows write skew (G2-item), which repeatable read as Adya defines it forbids, so no REPEATABLE READ here meets repeatable read. The bold ones are not even snapshot isolation: G-single (read skew) and non-repeatable reads. In MySQL, MariaDB 10.11 and pessimistic TiDB a write reads the latest committed row, not the snapshot, so a later read in the same transaction sees what others committed in between. MariaDB 11.8 fixes this with `innodb_snapshot_isolation`, which is on there by default and off in 10.11.
 
 ## Checking the checker
 
 - Every anomaly has a small hand-built history in the tests, and breaking the checker on purpose (no real-time edges, no G1b check, a one-rw cycle named G2-item) fails them.
-- On 30 histories from Postgres and MySQL at every level, isocheck and Elle gave the same verdict for all 144 checks where Elle reached one. Elle timed out on the 3 others (large read committed histories, which isocheck checks in 0.2 s).
+- On 47 histories from these databases, isocheck and Elle gave the same verdict for all 226 checks where Elle reached one. Elle timed out on 6 others (large read committed histories; isocheck checks one in 0.2 s).
 - A build of [isodb](https://github.com/salw2e/isodb) with its serializable checks switched off is caught at SERIALIZABLE (G2-item).
 
 ## Anomalies
