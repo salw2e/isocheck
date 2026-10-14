@@ -86,7 +86,8 @@ func aborted(err error) bool {
 	}
 	var me *mysql.MySQLError
 	if errors.As(err, &me) {
-		return me.Number == 1213 || me.Number == 1205
+		// deadlock, lock wait timeout, MariaDB's "record has changed", TiDB's write conflict
+		return me.Number == 1213 || me.Number == 1205 || me.Number == 1020 || me.Number == 9007
 	}
 	return false
 }
@@ -265,6 +266,11 @@ func runTxn(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel, 
 // errKind is an error without the parts that differ every time (keys, timestamps, transaction ids
 // in CockroachDB's messages), so the same failure counts once.
 func errKind(err error) string {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		msg, _, _ := strings.Cut(me.Message, ", ")
+		return fmt.Sprintf("Error %d: %s", me.Number, msg)
+	}
 	var pe *pgconn.PgError
 	if !errors.As(err, &pe) {
 		return err.Error()
