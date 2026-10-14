@@ -32,6 +32,7 @@ type dialect struct {
 	driver, dsn          string
 	create, append, read string
 	drop                 string
+	level                []string // how to ask the level a transaction runs at; MySQL and MariaDB only show the session's
 }
 
 func dialectFor(c Config) (dialect, error) {
@@ -48,6 +49,7 @@ func dialectFor(c Config) (dialect, error) {
 			create: "CREATE TABLE " + t + " (k integer PRIMARY KEY, v text)",
 			append: "INSERT INTO " + t + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = " + t + ".v || ',' || excluded.v",
 			read:   "SELECT v FROM " + t + " WHERE k = $1",
+			level:  []string{"SHOW transaction_isolation"},
 		}, nil
 	case "mysql":
 		cfg := mysql.NewConfig()
@@ -84,7 +86,8 @@ func aborted(err error) bool {
 	}
 	var me *mysql.MySQLError
 	if errors.As(err, &me) {
-		return me.Number == 1213 || me.Number == 1205
+		// deadlock, lock wait timeout, MariaDB's "record has changed", TiDB's write conflict
+		return me.Number == 1213 || me.Number == 1205 || me.Number == 1020 || me.Number == 9007
 	}
 	return false
 }
@@ -121,28 +124,55 @@ func (k *keys) mops(rng *rand.Rand, n int) []Mop {
 	return out
 }
 
+// Outcome is what a run produced: the history, why transactions failed, and the isolation level
+// the database said it ran them at.
+type Outcome struct {
+	Ops    []Op
+	Errors map[string]int
+	Level  string
+}
+
+// actualLevel asks the database, inside a transaction at the requested level, what level it is
+// running; some quietly run another one.
+func actualLevel(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel) string {
+	for _, q := range d.level {
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: iso})
+		if err != nil {
+			return ""
+		}
+		var v string
+		err = tx.QueryRowContext(ctx, q).Scan(&v)
+		tx.Rollback()
+		if err == nil {
+			return strings.ToLower(strings.NewReplacer("-", " ", "_", " ").Replace(v))
+		}
+	}
+	return ""
+}
+
 // Run sets up the table, runs the transactions and returns the history.
-func Run(ctx context.Context, c Config, progress func(done int)) ([]Op, map[string]int, error) {
+func Run(ctx context.Context, c Config, progress func(done int)) (*Outcome, error) {
 	d, err := dialectFor(c)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	iso, ok := levels[c.Isolation]
 	if !ok {
-		return nil, nil, fmt.Errorf("unknown isolation level %q", c.Isolation)
+		return nil, fmt.Errorf("unknown isolation level %q", c.Isolation)
 	}
 	db, err := sql.Open(d.driver, d.dsn)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(c.Clients + 1)
 	db.SetMaxIdleConns(c.Clients + 1)
 	for _, q := range []string{d.drop, d.create} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
-			return nil, nil, fmt.Errorf("%s: %w", q, err)
+			return nil, fmt.Errorf("%s: %w", q, err)
 		}
 	}
+	level := actualLevel(ctx, db, d, iso)
 
 	ks := &keys{writes: map[int]int{}, max: c.MaxWrites}
 	for i := range c.Keys {
@@ -181,7 +211,7 @@ func Run(ctx context.Context, c Config, progress func(done int)) ([]Op, map[stri
 				record(Op{Type: status, Process: process, Value: result})
 				if err != nil {
 					mu.Lock()
-					errs[err.Error()]++
+					errs[errKind(err)]++
 					mu.Unlock()
 				}
 				if status == "info" {
@@ -198,7 +228,7 @@ func Run(ctx context.Context, c Config, progress func(done int)) ([]Op, map[stri
 		}(p)
 	}
 	wg.Wait()
-	return ops, errs, nil
+	return &Outcome{Ops: ops, Errors: errs, Level: level}, nil
 }
 
 func runTxn(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel, mops []Mop) (string, []Mop, error) {
@@ -231,6 +261,25 @@ func runTxn(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel, 
 		return "info", mops, err // the commit may or may not have happened
 	}
 	return "ok", result, nil
+}
+
+// errKind is an error without the parts that differ every time (keys, timestamps, transaction ids
+// in CockroachDB's messages), so the same failure counts once.
+func errKind(err error) string {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		msg, _, _ := strings.Cut(me.Message, ", ")
+		return fmt.Sprintf("Error %d: %s", me.Number, msg)
+	}
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		return err.Error()
+	}
+	parts := strings.SplitN(pe.Message, ": ", 4)
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	return pe.Code + " " + strings.Join(parts, ": ")
 }
 
 func parseList(s string, err error) ([]int, error) {
