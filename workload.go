@@ -32,6 +32,7 @@ type dialect struct {
 	driver, dsn          string
 	create, append, read string
 	drop                 string
+	level                []string // ways to ask which isolation level the transaction runs at
 }
 
 func dialectFor(c Config) (dialect, error) {
@@ -48,6 +49,7 @@ func dialectFor(c Config) (dialect, error) {
 			create: "CREATE TABLE " + t + " (k integer PRIMARY KEY, v text)",
 			append: "INSERT INTO " + t + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = " + t + ".v || ',' || excluded.v",
 			read:   "SELECT v FROM " + t + " WHERE k = $1",
+			level:  []string{"SHOW transaction_isolation"},
 		}, nil
 	case "mysql":
 		cfg := mysql.NewConfig()
@@ -64,6 +66,7 @@ func dialectFor(c Config) (dialect, error) {
 			create: "CREATE TABLE " + t + " (k int PRIMARY KEY, v text) ENGINE=InnoDB",
 			append: "INSERT INTO " + t + " (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))",
 			read:   "SELECT v FROM " + t + " WHERE k = ?",
+			level:  []string{"SELECT @@transaction_isolation", "SELECT @@tx_isolation"},
 		}, nil
 	}
 	return dialect{}, fmt.Errorf("unsupported database %q: use postgres:// or mysql://", u.Scheme)
@@ -121,28 +124,55 @@ func (k *keys) mops(rng *rand.Rand, n int) []Mop {
 	return out
 }
 
+// Outcome is what a run produced: the history, why transactions failed, and the isolation level
+// the database said it ran them at.
+type Outcome struct {
+	Ops    []Op
+	Errors map[string]int
+	Level  string
+}
+
+// actualLevel asks the database, inside a transaction at the requested level, what level it is
+// running; some quietly run another one.
+func actualLevel(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel) string {
+	for _, q := range d.level {
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: iso})
+		if err != nil {
+			return ""
+		}
+		var v string
+		err = tx.QueryRowContext(ctx, q).Scan(&v)
+		tx.Rollback()
+		if err == nil {
+			return strings.ToLower(strings.NewReplacer("-", " ", "_", " ").Replace(v))
+		}
+	}
+	return ""
+}
+
 // Run sets up the table, runs the transactions and returns the history.
-func Run(ctx context.Context, c Config, progress func(done int)) ([]Op, map[string]int, error) {
+func Run(ctx context.Context, c Config, progress func(done int)) (*Outcome, error) {
 	d, err := dialectFor(c)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	iso, ok := levels[c.Isolation]
 	if !ok {
-		return nil, nil, fmt.Errorf("unknown isolation level %q", c.Isolation)
+		return nil, fmt.Errorf("unknown isolation level %q", c.Isolation)
 	}
 	db, err := sql.Open(d.driver, d.dsn)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(c.Clients + 1)
 	db.SetMaxIdleConns(c.Clients + 1)
 	for _, q := range []string{d.drop, d.create} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
-			return nil, nil, fmt.Errorf("%s: %w", q, err)
+			return nil, fmt.Errorf("%s: %w", q, err)
 		}
 	}
+	level := actualLevel(ctx, db, d, iso)
 
 	ks := &keys{writes: map[int]int{}, max: c.MaxWrites}
 	for i := range c.Keys {
@@ -198,7 +228,7 @@ func Run(ctx context.Context, c Config, progress func(done int)) ([]Op, map[stri
 		}(p)
 	}
 	wg.Wait()
-	return ops, errs, nil
+	return &Outcome{Ops: ops, Errors: errs, Level: level}, nil
 }
 
 func runTxn(ctx context.Context, db *sql.DB, d dialect, iso sql.IsolationLevel, mops []Mop) (string, []Mop, error) {

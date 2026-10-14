@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 )
 
 const usage = `isocheck runs concurrent transactions against a database and checks what isolation it gave.
@@ -69,9 +70,7 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 		cfg := Config{URL: fs.Arg(0), Isolation: *isolation, Clients: *clients, Txns: *txns, Keys: *nkeys, MaxWrites: *maxWrites, MaxOps: *maxOps, Table: *table}
-		var errs map[string]int
-		var err error
-		ops, errs, err = Run(ctx, cfg, func(n int) {
+		out, err := Run(ctx, cfg, func(n int) {
 			if n%500 == 0 || n == *txns {
 				fmt.Fprintf(os.Stderr, "\r%d of %d transactions", n, *txns)
 			}
@@ -80,7 +79,11 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
-		printErrors(errs)
+		ops = out.Ops
+		printErrors(out.Errors)
+		if want := strings.ReplaceAll(*isolation, "-", " "); out.Level != "" && out.Level != want {
+			fmt.Printf("Asked for %s; the database ran %s.\n\n", want, out.Level)
+		}
 		if *save != "" {
 			f, err := os.Create(*save)
 			if err != nil {
@@ -97,6 +100,9 @@ func main() {
 		fail(err)
 	}
 	r := Check(txs)
+	if r.OK == 0 {
+		fail(fmt.Errorf("no transaction committed, so there is nothing to check"))
+	}
 	Print(os.Stdout, r)
 	if model != "" {
 		if v := r.Violations(model); len(v) > 0 {
