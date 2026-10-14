@@ -32,7 +32,7 @@ type dialect struct {
 	driver, dsn          string
 	create, append, read string
 	drop                 string
-	level                []string // ways to ask which isolation level the transaction runs at
+	level                []string // how to ask the level a transaction runs at; MySQL and MariaDB only show the session's
 }
 
 func dialectFor(c Config) (dialect, error) {
@@ -66,7 +66,6 @@ func dialectFor(c Config) (dialect, error) {
 			create: "CREATE TABLE " + t + " (k int PRIMARY KEY, v text) ENGINE=InnoDB",
 			append: "INSERT INTO " + t + " (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))",
 			read:   "SELECT v FROM " + t + " WHERE k = ?",
-			level:  []string{"SELECT @@transaction_isolation", "SELECT @@tx_isolation"},
 		}, nil
 	}
 	return dialect{}, fmt.Errorf("unsupported database %q: use postgres:// or mysql://", u.Scheme)
