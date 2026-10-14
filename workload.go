@@ -29,9 +29,9 @@ type Config struct {
 }
 
 type dialect struct {
-	driver, dsn            string
-	create, append, read   string
-	drop                   string
+	driver, dsn          string
+	create, append, read string
+	drop                 string
 }
 
 func dialectFor(c Config) (dialect, error) {
