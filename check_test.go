@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func ap(k, v int) Mop          { return Mop{F: Append, K: k, V: v} }
-func rd(k int, l ...int) Mop    { return Mop{F: Read, K: k, List: append([]int{}, l...)} }
+func ap(k, v int) Mop        { return Mop{F: Append, K: k, V: v} }
+func rd(k int, l ...int) Mop { return Mop{F: Read, K: k, List: append([]int{}, l...)} }
 func tx(status string, start, end int64, mops ...Mop) Txn {
 	return Txn{Status: status, Start: start, End: end, Mops: mops}
 }
@@ -86,6 +86,17 @@ func TestAnomalies(t *testing.T) {
 		{"internal: a read that misses its own append", []Txn{
 			tx("ok", 0, 1, ap(1, 5), rd(1)),
 		}, []string{"internal"}},
+		{"internal: a second read that lost a value", []Txn{
+			tx("ok", 0, 1, ap(1, 1)),
+			tx("ok", 2, 3, ap(1, 2)),
+			tx("ok", 4, 5, rd(1, 1, 2), rd(1, 1)),
+		}, []string{"internal"}},
+		{"non-repeatable read: others' append between two reads", []Txn{
+			tx("ok", 0, 1, ap(1, 1)),
+			tx("ok", 2, 9, rd(1, 1), ap(1, 3), rd(1, 1, 2, 3)),
+			tx("ok", 3, 4, ap(1, 2)),
+			tx("ok", 10, 11, rd(1, 1, 2, 3)),
+		}, []string{"G-single", "non-repeatable-read"}}, // it also missed 2 the first time: read skew
 		{"garbage read", []Txn{
 			tx("ok", 0, 1, rd(1, 99)),
 		}, []string{"garbage-read"}},
@@ -126,6 +137,14 @@ func TestModels(t *testing.T) {
 		if got := len(skew.Violations(model)) == 0; got != ok {
 			t.Errorf("write skew under %s: consistent = %v, want %v", model, got, ok)
 		}
+	}
+	nrr := run(
+		tx("ok", 0, 1, ap(1, 1)),
+		tx("ok", 2, 9, rd(1, 1), rd(1, 1, 2)),
+		tx("ok", 3, 4, ap(1, 2)),
+	)
+	if len(nrr.Violations("read-committed")) != 0 || len(nrr.Violations("snapshot-isolation")) == 0 {
+		t.Errorf("a non-repeatable read is read committed but not snapshot isolation: %v", nrr.Counts)
 	}
 	stale := run(
 		tx("ok", 0, 10, ap(1, 1)),

@@ -60,8 +60,8 @@ var Models = []struct {
 	Forbid []string
 }{
 	{"read-committed", []string{"G0", "G1a", "G1b", "G1c", "internal", "garbage-read", "duplicate-elements", "incompatible-order"}},
-	{"snapshot-isolation", []string{"G-single"}},
-	{"repeatable-read", []string{"G-single", "G2-item"}},
+	{"snapshot-isolation", []string{"G-single", "non-repeatable-read"}},
+	{"repeatable-read", []string{"G-single", "G2-item", "non-repeatable-read"}},
 	{"serializable", []string{"G-single", "G2-item"}},
 	{"strict-serializable", []string{"G0-realtime", "G1c-realtime", "G-single-realtime", "G2-item-realtime"}},
 }
@@ -162,11 +162,12 @@ func Check(txns []Txn) *Result {
 		if t.Status != "ok" {
 			continue
 		}
-		state := map[int][]int{}
+		last := map[int][]int{} // the key as the transaction last read it
+		mine := map[int][]int{} // its appends to the key since then
 		known := map[int]bool{}
 		for _, m := range t.Mops {
 			if m.F == Append {
-				state[m.K] = append(state[m.K], m.V)
+				mine[m.K] = append(mine[m.K], m.V)
 				continue
 			}
 			if m.List == nil {
@@ -188,14 +189,20 @@ func Check(txns []Txn) *Result {
 					observed[w] = true
 				}
 			}
-			if own := state[m.K]; known[m.K] && !slices.Equal(own, m.List) || !known[m.K] && len(own) > 0 && !hasSuffix(m.List, own) {
-				want := listText(own)
+			// a read must keep what the transaction read before and end with what it appended since;
+			// anything new in between came from others, which only read committed allows
+			prev, own := last[m.K], mine[m.K]
+			switch {
+			case !isPrefix(prev, m.List) || !hasSuffix(m.List, own):
+				want := listText(append(slices.Clone(prev), own...))
 				if !known[m.K] {
-					want = "... " + want
+					want = "... " + listText(own)
 				}
 				report(Anomaly{Kind: "internal", Txns: []int{i}, Why: fmt.Sprintf("T%d read key %d = %s but its own reads and appends say %s", i, m.K, listText(m.List), want)})
+			case known[m.K] && len(m.List) != len(prev)+len(own):
+				report(Anomaly{Kind: "non-repeatable-read", Txns: []int{i}, Why: fmt.Sprintf("T%d read key %d as %s, then as %s with others' appends in between", i, m.K, listText(prev), listText(m.List))})
 			}
-			state[m.K], known[m.K] = slices.Clone(m.List), true
+			last[m.K], mine[m.K], known[m.K] = slices.Clone(m.List), nil, true
 			if len(m.List) > len(longest[m.K]) {
 				longest[m.K] = m.List
 			}
@@ -515,10 +522,13 @@ func findCycles(g *graph, scc []int, report func(Anomaly)) {
 					continue
 				}
 				steps := append([]Step{{a, b, s.start, g.why[[3]int{a, b, int(s.start)}]}}, path...)
-				if k := classify(steps); k == s.kind {
+				// a cycle of another kind than the one sought is still reported, under its own name
+				if k := classify(steps); !found[k] {
 					report(Anomaly{Kind: k, Steps: steps})
 					found[k] = true
-					break search
+					if k == s.kind {
+						break search
+					}
 				}
 			}
 		}
